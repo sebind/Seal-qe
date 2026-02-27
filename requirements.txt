@@ -1,9 +1,9 @@
 streamlit
 numpy
+matplotlib
 ase
 spglib
 seekpath
-py3Dmol
-matplotlib
-scipy
 pymatgen
+py3Dmol
+scipy
