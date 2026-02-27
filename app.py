@@ -1,22 +1,24 @@
 import streamlit as st
 import numpy as np
-import os
-import subprocess
 import matplotlib.pyplot as plt
 from ase.io import read, write
 from ase.build import surface
 from ase.spacegroup import get_spacegroup
 from collections import Counter
 import py3Dmol
-import seekpath
 from io import StringIO
+import seekpath
+import spglib
+from pymatgen.io.ase import AseAtomsAdaptor
+from pymatgen.symmetry.kpath import KPathSeek
+from pymatgen.electronic_structure.plotter import plot_brillouin_zone
 
 st.set_page_config(layout="wide")
-st.title("SeAl Pro — Quantum ESPRESSO Workflow GUI")
+st.title("SeAl Pro — Intelligent Quantum ESPRESSO GUI")
 
-# ======================================================
-# ----------------- Utility Functions ------------------
-# ======================================================
+# ==========================================================
+# Utility Functions
+# ==========================================================
 
 def parse_structure(file):
     if file.name.endswith(".cif"):
@@ -41,206 +43,199 @@ def show_structure(atoms):
     return view
 
 
-def auto_kmesh(atoms, density=0.2):
-    lengths = atoms.cell.lengths()
-    return [max(1, int(1/(l*density))) for l in lengths]
+# ================= Crystal Identification =================
+
+def get_crystal_system(number):
+    if 1 <= number <= 2:
+        return "Triclinic"
+    elif 3 <= number <= 15:
+        return "Monoclinic"
+    elif 16 <= number <= 74:
+        return "Orthorhombic"
+    elif 75 <= number <= 142:
+        return "Tetragonal"
+    elif 143 <= number <= 167:
+        return "Trigonal"
+    elif 168 <= number <= 194:
+        return "Hexagonal"
+    elif 195 <= number <= 230:
+        return "Cubic"
+    return "Unknown"
 
 
-def generate_qe_input(atoms, settings):
-    nat = len(atoms)
-    species = sorted(set(atoms.get_chemical_symbols()))
+def analyze_crystal(atoms):
+    lattice = atoms.cell.array
+    positions = atoms.get_scaled_positions()
+    numbers = atoms.get_atomic_numbers()
 
-    qe = []
-    qe.append("&CONTROL")
-    qe.append(f"  calculation='{settings['calculation']}'")
-    qe.append(f"  prefix='{settings['prefix']}'")
-    qe.append("  pseudo_dir='./pseudo/'")
-    qe.append("  outdir='./tmp/'")
-    qe.append("/")
+    dataset = spglib.get_symmetry_dataset((lattice, positions, numbers))
+    return {
+        "spacegroup": dataset["international"],
+        "number": dataset["number"],
+        "pointgroup": dataset["pointgroup"],
+        "crystal_system": get_crystal_system(dataset["number"])
+    }
 
-    qe.append("&SYSTEM")
-    qe.append("  ibrav=0")
-    qe.append(f"  nat={nat}")
-    qe.append(f"  ntyp={len(species)}")
-    qe.append(f"  ecutwfc={settings['ecutwfc']}")
-    qe.append(f"  ecutrho={settings['ecutrho']}")
-    qe.append(f"  input_dft='{settings['functional']}'")
 
-    if settings["spin"]:
-        qe.append("  nspin=2")
-        qe.append("  starting_magnetization(1)=0.5")
+# ================= Automatic K-Point Suggestion =================
 
-    if settings["dftu"]:
-        qe.append("  lda_plus_u=.true.")
-        for i in range(len(species)):
-            qe.append(f"  Hubbard_U({i+1})={settings['U']}")
+def guess_metallic(atoms):
+    metals = ["Fe", "Co", "Ni", "Cr", "Mn", "Cu"]
+    return any(m in atoms.get_chemical_symbols() for m in metals)
 
-    if settings["functional"] == "HSE":
-        qe.append("  exx_fraction=0.25")
-        qe.append("  screening_parameter=0.11")
 
-    qe.append("/")
+def suggest_kmesh(atoms, metallic=False):
+    recip = atoms.cell.reciprocal()
+    lengths = recip.lengths()
 
-    qe.append("&ELECTRONS")
-    qe.append("  conv_thr=1.0d-6")
-    qe.append("/")
+    density = 45 if metallic else 30
+    kmesh = [max(1, int(l * density / (2*np.pi))) for l in lengths]
 
-    qe.append("ATOMIC_SPECIES")
-    for s in species:
-        qe.append(f"{s} 1.0 {s}.UPF")
+    cell_lengths = atoms.cell.lengths()
+    if max(cell_lengths) > 20:
+        kmesh[2] = 1
 
-    qe.append("CELL_PARAMETERS angstrom")
-    for v in atoms.cell.array:
-        qe.append(f"{v[0]} {v[1]} {v[2]}")
+    return kmesh
 
-    qe.append("ATOMIC_POSITIONS angstrom")
-    for s, pos in zip(atoms.get_chemical_symbols(), atoms.positions):
-        qe.append(f"{s} {pos[0]} {pos[1]} {pos[2]}")
 
-    if settings["calculation"] == "bands":
-        qe.append("K_POINTS automatic")
-        qe.append("4 4 4 1 1 1")
+# ================= Pseudopotential Suggestion =================
+
+def suggest_pseudo(atoms, functional, metallic=False, dftu=False):
+    if functional == "HSE":
+        family = "SSSP_precision"
+    elif metallic:
+        family = "SSSP_precision"
     else:
-        k = settings["kmesh"]
-        qe.append("K_POINTS automatic")
-        qe.append(f"{k[0]} {k[1]} {k[2]} 1 1 1")
+        family = "SSSP_efficiency"
 
-    return "\n".join(qe)
+    if dftu:
+        family += "_relativistic"
 
+    species = sorted(set(atoms.get_chemical_symbols()))
+    return {s: f"{family}/{s}.UPF" for s in species}
+
+
+# ================= Automatic k-Path =================
+
+def generate_kpath(atoms):
+    lattice = atoms.cell.array
+    positions = atoms.get_scaled_positions()
+    numbers = atoms.get_atomic_numbers()
+
+    path_data = seekpath.get_path((lattice, positions, numbers))
+    return path_data["point_coords"], path_data["path"]
+
+
+def qe_kpath_block(kpoints, path, n=20):
+    lines = ["K_POINTS crystal_b", str(len(path))]
+    for segment in path:
+        label = segment[0]
+        coords = kpoints[label]
+        lines.append(
+            f"{coords[0]:.6f} {coords[1]:.6f} {coords[2]:.6f} {n} ! {label}"
+        )
+    return "\n".join(lines)
+
+
+# ================= Band & DOS Plot =================
 
 def plot_bands(file):
     data = np.loadtxt(file)
     k = data[:,0]
     energies = data[:,1:]
-
     fig, ax = plt.subplots()
     for i in range(energies.shape[1]):
         ax.plot(k, energies[:,i])
     ax.axhline(0, linestyle="--")
-    ax.set_xlabel("k-path")
-    ax.set_ylabel("Energy (eV)")
     return fig
 
 
 def plot_dos(file):
     data = np.loadtxt(file)
-    energy = data[:,0]
-    dos = data[:,1]
-
     fig, ax = plt.subplots()
-    ax.plot(energy, dos)
+    ax.plot(data[:,0], data[:,1])
     ax.axvline(0, linestyle="--")
-    ax.set_xlabel("Energy (eV)")
-    ax.set_ylabel("DOS")
     return fig
 
 
-def generate_phonon_input(prefix):
-    return f"""
-&INPUTPH
- prefix='{prefix}'
- outdir='./tmp/'
- fildyn='dynmat'
-/
-0.0 0.0 0.0
-"""
-
-
-# ======================================================
-# ---------------------- Sidebar -----------------------
-# ======================================================
+# ==========================================================
+# Sidebar Controls
+# ==========================================================
 
 with st.sidebar:
-    st.header("Calculation Settings")
 
-    calculation = st.selectbox("Calculation", ["scf", "relax", "vc-relax", "bands"])
-    functional = st.selectbox("XC Functional", ["PBE", "PBEsol", "HSE"])
-    ecutwfc = st.number_input("ecutwfc", 10.0, 200.0, 40.0)
-    ecutrho = st.number_input("ecutrho", 50.0, 1000.0, 320.0)
+    st.header("Calculation")
+
+    calculation = st.selectbox("calculation",
+                               ["scf", "relax", "vc-relax", "bands"])
+    functional = st.selectbox("XC Functional",
+                               ["PBE", "PBEsol", "HSE"])
+
     spin = st.checkbox("Spin Polarized")
     dftu = st.checkbox("DFT+U")
-    U = st.number_input("Hubbard U (eV)", 0.0, 10.0, 4.0) if dftu else 0.0
-    auto_k = st.checkbox("Auto k-mesh", value=True)
+    U = st.number_input("Hubbard U", 0.0, 10.0, 4.0) if dftu else 0.0
 
-# ======================================================
-# ---------------------- Main --------------------------
-# ======================================================
+    auto_k = st.checkbox("Auto Monkhorst-Pack", True)
+    auto_pp = st.checkbox("Auto Pseudopotential", True)
+
+    ecutwfc = st.number_input("ecutwfc", 10.0, 200.0, 40.0)
+    ecutrho = st.number_input("ecutrho", 50.0, 1000.0, 320.0)
+
+
+# ==========================================================
+# Main
+# ==========================================================
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("Upload CIF or XYZ")
-    uploaded = st.file_uploader("Upload structure", type=["cif", "xyz"])
+    uploaded = st.file_uploader("Upload CIF / XYZ", type=["cif", "xyz"])
 
     if uploaded:
         atoms = parse_structure(uploaded)
         st.success("Structure Loaded")
         st.write("Formula:", build_formula(atoms))
 
-        try:
-            sg = get_spacegroup(atoms)
-            st.write("Space Group:", sg)
-        except:
-            st.warning("Symmetry detection failed")
+        analysis = analyze_crystal(atoms)
+        st.write("Crystal System:", analysis["crystal_system"])
+        st.write("Space Group:",
+                 f"{analysis['spacegroup']} ({analysis['number']})")
+        st.write("Point Group:", analysis["pointgroup"])
 
         view = show_structure(atoms)
         st.components.v1.html(view._make_html(), height=500)
 
-        if st.checkbox("Generate Slab"):
-            hkl = tuple(map(int, st.text_input("Miller indices", "1 0 0").split()))
-            layers = st.number_input("Layers", 1, 10, 3)
-            atoms = surface(atoms, hkl, layers)
-            st.success("Slab generated")
-
 
 with col2:
     if uploaded:
-        prefix = st.text_input("Prefix", build_formula(atoms))
+
+        metallic = guess_metallic(atoms)
 
         if auto_k:
-            kmesh = auto_kmesh(atoms)
-        else:
-            kmesh = (
-                st.number_input("kx", 1, 20, 4),
-                st.number_input("ky", 1, 20, 4),
-                st.number_input("kz", 1, 20, 4),
-            )
+            kmesh = suggest_kmesh(atoms, metallic)
+            st.info(f"Suggested k-mesh: {kmesh}")
 
-        settings = {
-            "calculation": calculation,
-            "prefix": prefix,
-            "ecutwfc": ecutwfc,
-            "ecutrho": ecutrho,
-            "functional": functional,
-            "spin": spin,
-            "dftu": dftu,
-            "U": U,
-            "kmesh": kmesh
-        }
+        if auto_pp:
+            pp_dict = suggest_pseudo(atoms, functional, metallic, dftu)
+            st.write("Suggested Pseudopotentials:")
+            for k,v in pp_dict.items():
+                st.write(f"{k} → {v}")
 
-        qe_input = generate_qe_input(atoms, settings)
-
-        st.subheader("QE Input")
-        st.code(qe_input)
-        st.download_button("Download QE Input", qe_input, file_name="qe.in")
-
-        st.subheader("Phonon Input")
-        ph_input = generate_phonon_input(prefix)
-        st.code(ph_input)
-        st.download_button("Download ph.in", ph_input, file_name="ph.in")
+        st.subheader("Automatic Band k-Path")
+        kpoints, path = generate_kpath(atoms)
+        qe_path = qe_kpath_block(kpoints, path)
+        st.code(qe_path)
 
         st.subheader("Band Plot")
-        band_file = st.file_uploader("Upload bands.dat.gnu", type=["dat"])
+        band_file = st.file_uploader("Upload bands.dat", type=["dat"])
         if band_file:
-            with open("bands.dat", "wb") as f:
+            with open("bands.dat","wb") as f:
                 f.write(band_file.read())
-            fig = plot_bands("bands.dat")
-            st.pyplot(fig)
+            st.pyplot(plot_bands("bands.dat"))
 
         st.subheader("DOS Plot")
         dos_file = st.file_uploader("Upload dos.dat", type=["dat"])
         if dos_file:
-            with open("dos.dat", "wb") as f:
+            with open("dos.dat","wb") as f:
                 f.write(dos_file.read())
-            fig = plot_dos("dos.dat")
-            st.pyplot(fig)
+            st.pyplot(plot_dos("dos.dat"))
