@@ -1,4 +1,4 @@
-# SeAl Pro – Quantum ESPRESSO GUI
+# SeAl qe – Quantum ESPRESSO GUI
 
 ## Features
 - CIF / XYZ upload
